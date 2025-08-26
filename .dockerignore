@@ -1,0 +1,12 @@
+.git
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+venv/
+.cache/
+dist/
+build/
+node_modules/
+top_posts_24h.csv
