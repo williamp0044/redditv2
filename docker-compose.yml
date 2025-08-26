@@ -1,0 +1,30 @@
+version: "3.9"
+
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: reddit-top24h
+    ports:
+      - "6798:8000"   # external:internal
+    env_file:
+      - .env
+    restart: unless-stopped
+    # Optional bind mount to live-edit static files without rebuilding
+    # volumes:
+    #   - ./static:/app/static:ro
+    healthcheck:
+      test: >
+        python -c "import urllib.request,sys;
+        url='http://127.0.0.1:8000/healthz';
+        req=urllib.request.Request(url);
+        try:
+            with urllib.request.urlopen(req, timeout=3) as r:
+                sys.exit(0 if r.read()==b'ok' else 1)
+        except Exception:
+            sys.exit(1)"
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s

@@ -1,0 +1,332 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Reddit Top 24h</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Inter, Arial, sans-serif; }
+    header { padding: 16px 20px; border-bottom: 1px solid #ccc; }
+    main { max-width: 1100px; margin: 0 auto; padding: 20px; }
+    .topbar { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+    .toolbar { display: grid; grid-template-columns: 1fr auto auto auto auto; gap: 12px; align-items: center; }
+    .search { padding: 10px 12px; border: 1px solid #bbb; border-radius: 8px; min-width: 220px; }
+    select, .refresh { padding: 10px 12px; border: 1px solid #bbb; border-radius: 8px; background: transparent; }
+    .checkbox { display: flex; gap: 8px; align-items: center; }
+    .pill { padding: 2px 8px; border: 1px solid #aaa; border-radius: 999px; font-size: 12px; justify-self: end; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; margin-top: 16px; }
+    .card { border: 1px solid #bbb; border-radius: 12px; padding: 14px; display: flex; flex-direction: column; gap: 10px; background: rgba(255,255,255,0.04); }
+    .thumb { width: 100%; height: 180px; object-fit: cover; border-radius: 10px; border: 1px solid #aaa; }
+    .sub { font-size: 12px; opacity: 0.8; }
+    .title { font-size: 16px; font-weight: 600; line-height: 1.3; }
+    .meta { font-size: 13px; opacity: 0.9; display: flex; gap: 8px; flex-wrap: wrap; }
+    .links { display: flex; gap: 10px; margin-top: 6px; }
+    .btn { text-decoration: none; padding: 8px 10px; border: 1px solid #888; border-radius: 8px; font-size: 13px; }
+    .empty { opacity: 0.7; text-align: center; padding: 40px; }
+    .pager { display: flex; gap: 8px; align-items: center; margin-top: 12px; }
+    .pager button { padding: 8px 10px; border: 1px solid #bbb; border-radius: 8px; background: transparent; }
+    .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+    .chip { padding: 4px 8px; border: 1px solid #999; border-radius: 9999px; font-size: 12px; }
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="topbar">
+      <h1 style="margin: 0; font-size: 18px;">Reddit Top Posts in the Last 24 Hours</h1>
+      <button id="refresh" class="refresh">Refresh</button>
+    </div>
+  </header>
+  <main>
+    <div class="toolbar">
+      <input id="q" class="search" type="search" placeholder="Filter by subreddit or title..." />
+      <select id="sort">
+        <option value="score">Sort: Score</option>
+        <option value="comments">Sort: Comments</option>
+        <option value="new">Sort: New</option>
+      </select>
+      <label class="checkbox">
+        <input id="nsfw" type="checkbox" />
+        Include NSFW
+      </label>
+      <label class="checkbox">
+        <input id="nocache" type="checkbox" />
+        Force refresh
+      </label>
+      <div id="status" class="pill" style="opacity:.8;">Idle</div>
+    </div>
+
+    <div class="row" style="margin-top:12px;">
+      <select id="subs" multiple size="5" style="min-width:320px; max-width:100%;"></select>
+      <button id="applySubs" class="refresh">Apply subs</button>
+      <button id="clearSubs" class="refresh">Clear</button>
+      <button id="copyLink" class="refresh">Copy share link</button>
+    </div>
+    <div class="chips" id="chips"></div>
+
+    <div id="grid" class="grid"></div>
+    <div id="empty" class="empty" style="display:none;">No posts match your filter</div>
+
+    <div class="pager">
+      <button id="prev">Prev</button>
+      <span id="pageInfo"></span>
+      <button id="next">Next</button>
+      <div id="count" class="pill">0 posts</div>
+    </div>
+  </main>
+
+  <script>
+    const grid = document.getElementById("grid");
+    const empty = document.getElementById("empty");
+    const count = document.getElementById("count");
+    const q = document.getElementById("q");
+    const refreshBtn = document.getElementById("refresh");
+    const statusEl = document.getElementById("status");
+    const nocache = document.getElementById("nocache");
+    const sortSel = document.getElementById("sort");
+    const nsfwChk = document.getElementById("nsfw");
+    const prevBtn = document.getElementById("prev");
+    const nextBtn = document.getElementById("next");
+    const pageInfo = document.getElementById("pageInfo");
+    const subsSelect = document.getElementById("subs");
+    const applySubsBtn = document.getElementById("applySubs");
+    const clearSubsBtn = document.getElementById("clearSubs");
+    const copyLinkBtn = document.getElementById("copyLink");
+    const chips = document.getElementById("chips");
+
+    let allPosts = [];
+    let total = 0;
+    let offset = 0;
+    const limit = 30;
+
+    let chosenSubs = loadSubsFromUrl() || loadSubsFromStorage() || null;
+    let availableSubs = [];
+
+    function fmt(n) { return new Intl.NumberFormat().format(n); }
+    function fmtDate(iso) { try { return new Date(iso).toLocaleString(); } catch { return iso; } }
+    function setStatus(text) { statusEl.textContent = text || ""; }
+
+    function escapeHtml(s) {
+      return String(s)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#39;");
+    }
+
+    function imageFor(p) {
+      if (p.image) return p.image;
+      if (p.thumbnail) return p.thumbnail;
+      return null;
+    }
+
+    function render(posts) {
+      grid.innerHTML = "";
+      count.textContent = `${posts.length} of ${total}`;
+      pageInfo.textContent = `Page ${Math.floor(offset / limit) + 1} of ${Math.max(1, Math.ceil(total / limit))}`;
+
+      if (posts.length === 0) {
+        empty.style.display = "block";
+        return;
+      }
+      empty.style.display = "none";
+
+      for (const p of posts) {
+        const card = document.createElement("article");
+        card.className = "card";
+        const img = imageFor(p);
+        card.innerHTML = `
+          ${img ? `<img class="thumb" src="${img}" alt="">` : ""}
+          <div class="sub">r/${p.subreddit} • ${fmtDate(p.created_iso)}</div>
+          <div class="title">${p.title ? escapeHtml(p.title) : "(no title)"}</div>
+          <div class="meta">
+            <span>Score ${fmt(p.score ?? 0)}</span>
+            <span>Comments ${fmt(p.num_comments ?? 0)}</span>
+            <span>Upvote ratio ${(p.upvote_ratio ?? 0) * 100 | 0}%</span>
+            <span>by u/${p.author ?? "unknown"}</span>
+            ${p.over_18 ? `<span style="color:#b00;">NSFW</span>` : ""}
+          </div>
+          <div class="links">
+            <a class="btn" href="${p.permalink}" target="_blank" rel="noopener">Comments</a>
+            ${p.url ? `<a class="btn" href="${p.url}" target="_blank" rel="noopener">Link</a>` : ""}
+          </div>
+        `;
+        grid.appendChild(card);
+      }
+    }
+
+    function applyFilter() {
+      const term = q.value.trim().toLowerCase();
+      if (!term) return render(allPosts);
+      const filtered = allPosts.filter(p =>
+        (p.subreddit && p.subreddit.toLowerCase().includes(term)) ||
+        (p.title && p.title.toLowerCase().includes(term))
+      );
+      render(filtered);
+    }
+
+    function loadSubsFromUrl() {
+      const u = new URL(location.href);
+      const s = u.searchParams.get("subs");
+      if (!s) return null;
+      const arr = s.split(",").map(x => x.trim().toLowerCase()).filter(Boolean);
+      return arr.length ? arr : null;
+    }
+
+    function saveSubsToUrl(subs) {
+      const u = new URL(location.href);
+      if (subs && subs.length) u.searchParams.set("subs", subs.join(","));
+      else u.searchParams.delete("subs");
+      history.replaceState(null, "", u.toString());
+    }
+
+    function loadSubsFromStorage() {
+      try {
+        const s = localStorage.getItem("reddit_subs");
+        if (!s) return null;
+        const arr = JSON.parse(s);
+        return Array.isArray(arr) && arr.length ? arr : null;
+      } catch { return null; }
+    }
+
+    function saveSubsToStorage(subs) {
+      try {
+        if (subs && subs.length) localStorage.setItem("reddit_subs", JSON.stringify(subs));
+        else localStorage.removeItem("reddit_subs");
+      } catch {}
+    }
+
+    function fillSubsSelect(list) {
+      subsSelect.innerHTML = "";
+      for (const sub of list) {
+        const opt = document.createElement("option");
+        opt.value = sub;
+        opt.textContent = `r/${sub}`;
+        if (chosenSubs && chosenSubs.includes(sub)) opt.selected = true;
+        subsSelect.appendChild(opt);
+      }
+      renderChips();
+    }
+
+    function getSelectedSubs() {
+      return Array.from(subsSelect.selectedOptions).map(o => o.value);
+    }
+
+    function renderChips() {
+      chips.innerHTML = "";
+      const active = chosenSubs && chosenSubs.length ? chosenSubs : [];
+      active.forEach(sub => {
+        const span = document.createElement("span");
+        span.className = "chip";
+        span.textContent = `r/${sub}`;
+        span.title = "Click to remove";
+        span.style.cursor = "pointer";
+        span.addEventListener("click", () => {
+          chosenSubs = active.filter(s => s !== sub);
+          saveSubsToStorage(chosenSubs);
+          saveSubsToUrl(chosenSubs);
+          setSelectFromChosen();
+          offset = 0;
+          load();
+        });
+        chips.appendChild(span);
+      });
+    }
+
+    function setSelectFromChosen() {
+      const set = new Set(chosenSubs || []);
+      for (const opt of subsSelect.options) {
+        opt.selected = set.has(opt.value);
+      }
+      renderChips();
+    }
+
+    async function fetchSubs() {
+      const res = await fetch("/api/subreddits");
+      const data = await res.json();
+      availableSubs = data.subs || [];
+      fillSubsSelect(availableSubs);
+    }
+
+    async function load() {
+      refreshBtn.disabled = true;
+      setStatus("Fetching...");
+      try {
+        const params = new URLSearchParams();
+        params.set("sort", sortSel.value);
+        params.set("nsfw", nsfwChk.checked ? "true" : "false");
+        params.set("offset", String(offset));
+        params.set("limit", String(limit));
+        if (nocache.checked) params.set("force", "true");
+        if (chosenSubs && chosenSubs.length) params.set("subs", chosenSubs.join(","));
+
+        const res = await fetch(`/api/top-posts?${params.toString()}`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        total = data.total || 0;
+        allPosts = data.items || [];
+        render(allPosts);
+        setStatus(`Loaded ${allPosts.length} items`);
+      } catch (e) {
+        console.error(e);
+        grid.innerHTML = "";
+        empty.style.display = "block";
+        empty.textContent = "Failed to load posts";
+        count.textContent = "0";
+        setStatus("Error");
+      } finally {
+        refreshBtn.disabled = false;
+      }
+    }
+
+    // wire up
+    q.addEventListener("input", applyFilter);
+    refreshBtn.addEventListener("click", () => { offset = 0; load(); });
+    sortSel.addEventListener("change", () => { offset = 0; load(); });
+    nsfwChk.addEventListener("change", () => { offset = 0; load(); });
+    prevBtn.addEventListener("click", () => { offset = Math.max(0, offset - limit); load(); });
+    nextBtn.addEventListener("click", () => { if (offset + limit < total) { offset += limit; load(); } });
+
+    applySubsBtn.addEventListener("click", () => {
+      chosenSubs = getSelectedSubs();
+      saveSubsToStorage(chosenSubs);
+      saveSubsToUrl(chosenSubs);
+      renderChips();
+      offset = 0;
+      load();
+    });
+
+    clearSubsBtn.addEventListener("click", () => {
+      chosenSubs = null;
+      saveSubsToStorage(null);
+      saveSubsToUrl(null);
+      setSelectFromChosen();
+      offset = 0;
+      load();
+    });
+
+    copyLinkBtn.addEventListener("click", async () => {
+      const u = new URL(location.href);
+      if (chosenSubs && chosenSubs.length) u.searchParams.set("subs", chosenSubs.join(","));
+      else u.searchParams.delete("subs");
+      try {
+        await navigator.clipboard.writeText(u.toString());
+        setStatus("Link copied");
+        setTimeout(() => setStatus(""), 1200);
+      } catch {
+        setStatus("Copy failed");
+        setTimeout(() => setStatus(""), 1200);
+      }
+    });
+
+    // boot
+    fetchSubs().then(() => {
+      // If URL had subs not in available list, keep them anyway
+      setSelectFromChosen();
+      load();
+    });
+  </script>
+</body>
+</html>
