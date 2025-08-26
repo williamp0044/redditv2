@@ -51,7 +51,16 @@ SUBREDDITS = (
     if SUBS_ENV else DEFAULT_SUBS
 )
 
-HEADERS = {"User-Agent": "Top24hFetcherWeb/1.2 (+local app)"}
+# Descriptive UA is important for Reddit; allow override via env.
+REDDIT_UA = os.getenv(
+    "REDDIT_USER_AGENT",
+    "RedditTop24h/1.0 (+https://example.com; contact: you@example.com)",
+)
+HEADERS = {
+    "User-Agent": REDDIT_UA,
+    "Accept": "application/json",
+}
+
 CACHE_TTL = int(os.getenv("CACHE_TTL", "300"))
 RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "120"))  # per IP for API endpoints
 
@@ -82,28 +91,68 @@ def pick_preview(d: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
 
 async def fetch_top_for_sub(session: aiohttp.ClientSession, sub: str) -> Optional[Dict[str, Any]]:
     url = f"https://www.reddit.com/r/{sub}/top.json?t=day&limit=5"
-    for attempt in range(3):
+    backoff = 1.0
+    for attempt in range(4):
         try:
-            async with session.get(url, headers=HEADERS) as resp:
+            async with session.get(url, headers=HEADERS, allow_redirects=True) as resp:
+                # Handle rate limiting explicitly
                 if resp.status == 429:
-                    retry_after = int(resp.headers.get("retry-after", "2") or "2")
-                    await asyncio.sleep(max(1, retry_after))
+                    retry_after = resp.headers.get("retry-after")
+                    sleep_s = float(retry_after) if retry_after else backoff
+                    log.warning("429 from Reddit for %s; sleeping %.1fs", sub, sleep_s)
+                    await asyncio.sleep(max(1.0, sleep_s))
+                    backoff = min(backoff * 2, 8.0)
                     continue
-                resp.raise_for_status()
-                data = await resp.json()
+
+                # Treat 5xx as transient
+                if 500 <= resp.status < 600:
+                    log.warning("5xx from Reddit for %s: %s", sub, resp.status)
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 8.0)
+                    continue
+
+                # Hard fail on 403/404
+                if resp.status in (403, 404):
+                    log.info("Skipping %s due to status %s", sub, resp.status)
+                    return None
+
+                # Try to parse JSON; Reddit sometimes serves HTML:
+                data: Optional[Dict[str, Any]] = None
+                ct = resp.headers.get("content-type", "")
+                body_text: Optional[str] = None
+
+                if "json" in ct.lower():
+                    try:
+                        data = await resp.json()
+                    except Exception:
+                        data = None
+                else:
+                    # Not JSON content-type; try to read text and then attempt JSON parsing
+                    body_text = await resp.text()
+                    try:
+                        data = await resp.json(content_type=None)
+                    except Exception:
+                        log.warning("Non-JSON response for %s (ct=%s, len=%s) – likely HTML landing/blocked",
+                                    sub, ct, len(body_text or ""))
+
+                if data is None:
+                    # Not parseable as JSON; nothing we can do for now
+                    return None
+
         except aiohttp.ClientResponseError as e:
             if e.status in (403, 404):
                 return None
-            if attempt < 2:
-                await asyncio.sleep(1 + attempt)
-                continue
-            return None
-        except aiohttp.ClientError:
-            if attempt < 2:
-                await asyncio.sleep(1 + attempt)
-                continue
-            return None
+            log.warning("ClientResponseError for %s (status %s): %s", sub, e.status, e)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 8.0)
+            continue
+        except aiohttp.ClientError as e:
+            log.warning("ClientError for %s: %s", sub, e)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 8.0)
+            continue
 
+        # Normal flow: pick candidates in last 24h
         children = data.get("data", {}).get("children", [])
         if not children:
             return None
@@ -208,10 +257,11 @@ _cache_at: float = 0.0
 _refresh_task: Optional[asyncio.Task] = None
 
 async def refresh_cache():
-    global _cache_data, _cache_at
+    global _cache_data, _cache_at, _metrics
     data = await fetch_all(SUBREDDITS)
     _cache_data = sort_posts(data, "score")
     _cache_at = monotonic()
+    _metrics["last_refresh_epoch"] = int(time.time())
     log.info("cache refreshed items=%s", len(_cache_data))
 
 @app.on_event("startup")
@@ -272,6 +322,7 @@ def metrics():
         f'reddit_errors_total {_metrics["errors_total"]}',
         f'reddit_cache_age_seconds {int(monotonic() - _cache_at) if _cache_at else -1}',
         f'reddit_cached_items {len(_cache_data or [])}',
+        f'reddit_last_refresh_epoch {_metrics["last_refresh_epoch"]}',
     ]
     return PlainTextResponse("\n".join(lines))
 
@@ -288,7 +339,7 @@ async def top_posts(
     offset: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=500),
 ):
-    global _cache_data, _cache_at  # <-- put here once, at the top
+    global _cache_data, _cache_at
 
     ip = request.client.host if request.client else "unknown"
     if not check_rate_limit(ip):
@@ -317,8 +368,6 @@ async def top_posts(
     total = len(data)
     slice_ = data[offset: offset + limit]
     return JSONResponse({"total": total, "items": slice_})
-
-
 
 @app.get("/api/subreddits")
 async def list_subreddits():
