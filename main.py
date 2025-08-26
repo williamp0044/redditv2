@@ -46,7 +46,6 @@ RAW_SUBREDDITS = [
 
 def clean_sub(s: str) -> str:
     s = s.strip()
-    # Remove only a literal "r/" prefix, not any 'r' or '/' characters.
     if s.lower().startswith("r/"):
         s = s[2:]
     return s.strip().lower()
@@ -59,19 +58,23 @@ SUBREDDITS = (
     if SUBS_ENV else DEFAULT_SUBS
 )
 
-# Descriptive UA is important for Reddit; allow override via env.
+# Headers
 REDDIT_UA = os.getenv(
     "REDDIT_USER_AGENT",
-    "RedditTop24h/1.0 (+https://example.com; contact: you@example.com)",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36 RedditTop24h/1.0",
 )
-HEADERS = {
+COMMON_HEADERS = {
     "User-Agent": REDDIT_UA,
-    "Accept": "application/json",
+    "Accept": "application/json, text/plain;q=0.9, */*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
+    "Connection": "keep-alive",
 }
+# Optional cookie string, e.g. "over18=1; edgebucket=..."
+REDDIT_COOKIES = os.getenv("REDDIT_COOKIES", "").strip()
 
 CACHE_TTL = int(os.getenv("CACHE_TTL", "300"))
-RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "120"))  # per IP for API endpoints
+RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "120"))  # per IP
 
 # ---------------------------
 # Helpers
@@ -98,57 +101,62 @@ def pick_preview(d: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
         thumb = t
     return img, thumb
 
+def make_endpoints(sub: str) -> List[str]:
+    # Try API first, then classic JSON endpoints
+    return [
+        f"https://api.reddit.com/r/{sub}/top?t=day&limit=5&raw_json=1",
+        f"https://www.reddit.com/r/{sub}/top.json?t=day&limit=5&raw_json=1",
+        f"https://old.reddit.com/r/{sub}/top.json?t=day&limit=5&raw_json=1",
+    ]
+
 async def fetch_top_for_sub(session: aiohttp.ClientSession, sub: str) -> Optional[Dict[str, Any]]:
-    # Prefer api.reddit.com which usually returns JSON without HTML interstitials
-    url = f"https://api.reddit.com/r/{sub}/top?t=day&limit=5&raw_json=1"
     backoff = 1.0
-    for attempt in range(4):
+    endpoints = make_endpoints(sub)
+
+    for attempt in range(5):
+        url = endpoints[min(attempt, len(endpoints) - 1)]
         try:
-            async with session.get(url, headers=HEADERS, allow_redirects=True) as resp:
-                if resp.status == 429:
-                    retry_after = resp.headers.get("retry-after")
-                    sleep_s = float(retry_after) if retry_after else backoff
-                    log.warning("429 from Reddit for %s; sleeping %.1fs", sub, sleep_s)
-                    await asyncio.sleep(max(1.0, sleep_s))
-                    backoff = min(backoff * 2, 8.0)
-                    continue
+            headers = dict(COMMON_HEADERS)
+            # some endpoints are picky about referer/origin
+            if "www.reddit.com" in url or "old.reddit.com" in url:
+                headers["Referer"] = f"https://www.reddit.com/r/{sub}/top/?t=day"
 
-                if 500 <= resp.status < 600:
-                    log.warning("5xx from Reddit for %s: %s", sub, resp.status)
-                    await asyncio.sleep(backoff)
-                    backoff = min(backoff * 2, 8.0)
-                    continue
+            cookies = None
+            if REDDIT_COOKIES:
+                # aiohttp accepts dict for cookies; parse a simple "k=v; k2=v2" string
+                cookies = {}
+                for part in REDDIT_COOKIES.split(";"):
+                    if "=" in part:
+                        k, v = part.strip().split("=", 1)
+                        cookies[k.strip()] = v.strip()
 
+            async with session.get(url, headers=headers, cookies=cookies, allow_redirects=True) as resp:
+                # hard 403/404 -> bail for this subreddit
                 if resp.status in (403, 404):
                     log.info("Skipping %s due to status %s", sub, resp.status)
                     return None
 
+                if resp.status == 429 or 500 <= resp.status < 600:
+                    retry_after = resp.headers.get("retry-after")
+                    sleep_s = float(retry_after) if retry_after else backoff
+                    await asyncio.sleep(min(max(1.0, sleep_s), 8.0))
+                    backoff = min(backoff * 2, 8.0)
+                    continue
+
                 ct = resp.headers.get("content-type", "")
                 if "json" in ct.lower():
-                    try:
-                        data = await resp.json()
-                    except Exception:
-                        data = None
+                    data = await resp.json()
                 else:
-                    # Reddit occasionally serves HTML; try permissive parse then give up
-                    try:
-                        data = await resp.json(content_type=None)
-                    except Exception:
-                        data = None
-                        log.warning("Non-JSON for %s (ct=%s)", sub, ct)
+                    # Be permissive; Reddit sometimes returns text/html with JSON body
+                    data = await resp.json(content_type=None)
 
-                if data is None:
-                    return None
-
-        except aiohttp.ClientResponseError as e:
-            if e.status in (403, 404):
-                return None
-            log.warning("ClientResponseError for %s (status %s): %s", sub, e.status, e)
+        except aiohttp.ContentTypeError:
+            # Not JSON parseable, try next endpoint/attempt
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 8.0)
             continue
         except aiohttp.ClientError as e:
-            log.warning("ClientError for %s: %s", sub, e)
+            log.warning("ClientError for %s (%s): %s", sub, url, e)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 8.0)
             continue
@@ -188,11 +196,13 @@ async def fetch_top_for_sub(session: aiohttp.ClientSession, sub: str) -> Optiona
             "image": img,
             "thumbnail": thumb,
         }
+
     return None
 
 async def fetch_all(subs: List[str]) -> List[Dict[str, Any]]:
-    timeout = aiohttp.ClientTimeout(total=60)
-    conn = aiohttp.TCPConnector(limit=16, ssl=False)
+    timeout = aiohttp.ClientTimeout(total=75)
+    # leave SSL=True (default); disabling can hurt with CF fronted sites
+    conn = aiohttp.TCPConnector(limit=16)
     results: List[Dict[str, Any]] = []
     async with aiohttp.ClientSession(timeout=timeout, connector=conn) as session:
         tasks = [fetch_top_for_sub(session, s) for s in subs]
@@ -243,7 +253,6 @@ def check_rate_limit(ip: str, limit: int = RATE_LIMIT_PER_MIN) -> bool:
     now = time.time()
     window_start = now - 60
     arr = _rate.setdefault(ip, [])
-    # drop old
     while arr and arr[0] < window_start:
         arr.pop(0)
     if len(arr) >= limit:
