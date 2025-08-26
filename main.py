@@ -43,11 +43,19 @@ RAW_SUBREDDITS = [
     "StocksAndTrading","therewasanattempt","ThisYouComebacks","tipofmytongue","Upwork",
     "ValueInvesting","videos","webdev","whitecoatinvestor","yesyesyesyesno",
 ]
-DEFAULT_SUBS = sorted(set(s.lower().lstrip("r/") for s in RAW_SUBREDDITS))
+
+def clean_sub(s: str) -> str:
+    s = s.strip()
+    # Remove only a literal "r/" prefix, not any 'r' or '/' characters.
+    if s.lower().startswith("r/"):
+        s = s[2:]
+    return s.strip().lower()
+
+DEFAULT_SUBS = sorted(set(clean_sub(s) for s in RAW_SUBREDDITS))
 
 SUBS_ENV = os.getenv("SUBREDDITS", "").strip()
 SUBREDDITS = (
-    sorted(set(s.strip().lower().lstrip("r/") for s in SUBS_ENV.split(",") if s.strip()))
+    sorted(set(clean_sub(s) for s in SUBS_ENV.split(",") if s.strip()))
     if SUBS_ENV else DEFAULT_SUBS
 )
 
@@ -59,6 +67,7 @@ REDDIT_UA = os.getenv(
 HEADERS = {
     "User-Agent": REDDIT_UA,
     "Accept": "application/json",
+    "Accept-Language": "en-US,en;q=0.9",
 }
 
 CACHE_TTL = int(os.getenv("CACHE_TTL", "300"))
@@ -90,12 +99,12 @@ def pick_preview(d: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
     return img, thumb
 
 async def fetch_top_for_sub(session: aiohttp.ClientSession, sub: str) -> Optional[Dict[str, Any]]:
-    url = f"https://www.reddit.com/r/{sub}/top.json?t=day&limit=5"
+    # Prefer api.reddit.com which usually returns JSON without HTML interstitials
+    url = f"https://api.reddit.com/r/{sub}/top?t=day&limit=5&raw_json=1"
     backoff = 1.0
     for attempt in range(4):
         try:
             async with session.get(url, headers=HEADERS, allow_redirects=True) as resp:
-                # Handle rate limiting explicitly
                 if resp.status == 429:
                     retry_after = resp.headers.get("retry-after")
                     sleep_s = float(retry_after) if retry_after else backoff
@@ -104,39 +113,31 @@ async def fetch_top_for_sub(session: aiohttp.ClientSession, sub: str) -> Optiona
                     backoff = min(backoff * 2, 8.0)
                     continue
 
-                # Treat 5xx as transient
                 if 500 <= resp.status < 600:
                     log.warning("5xx from Reddit for %s: %s", sub, resp.status)
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, 8.0)
                     continue
 
-                # Hard fail on 403/404
                 if resp.status in (403, 404):
                     log.info("Skipping %s due to status %s", sub, resp.status)
                     return None
 
-                # Try to parse JSON; Reddit sometimes serves HTML:
-                data: Optional[Dict[str, Any]] = None
                 ct = resp.headers.get("content-type", "")
-                body_text: Optional[str] = None
-
                 if "json" in ct.lower():
                     try:
                         data = await resp.json()
                     except Exception:
                         data = None
                 else:
-                    # Not JSON content-type; try to read text and then attempt JSON parsing
-                    body_text = await resp.text()
+                    # Reddit occasionally serves HTML; try permissive parse then give up
                     try:
                         data = await resp.json(content_type=None)
                     except Exception:
-                        log.warning("Non-JSON response for %s (ct=%s, len=%s) – likely HTML landing/blocked",
-                                    sub, ct, len(body_text or ""))
+                        data = None
+                        log.warning("Non-JSON for %s (ct=%s)", sub, ct)
 
                 if data is None:
-                    # Not parseable as JSON; nothing we can do for now
                     return None
 
         except aiohttp.ClientResponseError as e:
@@ -152,7 +153,6 @@ async def fetch_top_for_sub(session: aiohttp.ClientSession, sub: str) -> Optiona
             backoff = min(backoff * 2, 8.0)
             continue
 
-        # Normal flow: pick candidates in last 24h
         children = data.get("data", {}).get("children", [])
         if not children:
             return None
@@ -316,7 +316,6 @@ async def metrics_mw(request: Request, call_next):
 
 @app.get("/metrics")
 def metrics():
-    # very simple text format
     lines = [
         f'reddit_requests_total {_metrics["requests_total"]}',
         f'reddit_errors_total {_metrics["errors_total"]}',
@@ -346,7 +345,7 @@ async def top_posts(
         return JSONResponse({"error": "rate limited"}, status_code=429)
 
     chosen = SUBREDDITS if not subs else sorted(
-        set(s.strip().lower().lstrip("r/") for s in subs.split(",") if s.strip())
+        set(clean_sub(s) for s in subs.split(",") if s.strip())
     )
 
     now = monotonic()
